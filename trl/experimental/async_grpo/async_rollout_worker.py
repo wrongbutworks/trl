@@ -340,7 +340,7 @@ class AsyncRolloutLoop:
         self.max_tool_calling_iterations = max_tool_calling_iterations
         self.log_completions = log_completions
         self.num_completions_to_print = num_completions_to_print
-        self._fork_threshold_tokens = fork_threshold_tokens  # message mode only; token mode ignores it
+        self._fork_threshold_tokens = fork_threshold_tokens  # reconciler fork/realign threshold
         self.vllm_server_url = vllm_server_url.rstrip("/")
 
         tools = tools or []
@@ -633,87 +633,50 @@ class AsyncRolloutLoop:
     async def _generate_one(
         self, prompt: Messages, tool_dict: dict[str, Callable]
     ) -> tuple[list[int], list[dict[str, str]], list[int], list[TrainingSequence], int, int]:
-        completion, completion_ids, completion_logprobs, tool_mask = [], [], [], []
+        """Roll out one conversation, re-tokenizing the whole message list each turn and reconciling drift.
+
+        Every turn renders the full conversation through the chat template, generates, records the turn, and feeds the
+        tool result back as a message (re-tokenized on the next whole-conversation pass). At the end,
+        `_chain_to_sequences` reconciles re-tokenization drift into one or more training rows: a clean append stays one
+        row, a rewrite (dropped reasoning, summarized history) forks a new row. Rebuilding `prompt_ids` from the
+        message list each turn (instead of gluing tokens on the end and never looking back) is what lets the reconciler
+        catch rewrites. Returns the first turn's `prompt_ids` so the scorer can reconstruct the context.
+        """
+        messages = list(prompt)  # a MESSAGE list, not a token list
+        rollout_id = uuid.uuid4().hex
+        turns: list[TurnRecord] = []
+        completion, completion_ids = [], []
         tool_call_count = 0
         tool_failure_count = 0
         iteration_num = 0
         max_iterations = self.max_tool_calling_iterations
-        # Initial prompt tokens, returned so the scorer can reconstruct input_ids = prompt_ids + completion_ids.
-        # `running_ids` accumulates the turns/tool deltas fed back to the model; `prompt_ids` stays the prompt.
-        prompt_ids = self.tokenizer.apply_chat_template(
-            prompt,
-            return_dict=False,
-            add_generation_prompt=True,
-            tools=self.tools or None,
-            chat_template=self.chat_template,
-            **self.chat_template_kwargs,
-        )
-        running_ids = prompt_ids  # accumulator fed to the model; prompt_ids stays the (context) prompt
         while True:
-            turn_ids, turn_logprobs = await self._generate_one_turn(running_ids)
-            assistant_message = parse_response(self.tokenizer, turn_ids, prefix=running_ids)
+            prompt_ids = self.tokenizer.apply_chat_template(  # re-tokenize the WHOLE conversation
+                messages,
+                return_dict=False,
+                add_generation_prompt=True,
+                tools=self.tools or None,
+                chat_template=self.chat_template,
+                **self.chat_template_kwargs,
+            )
+            turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids)
+            assistant_message = parse_response(self.tokenizer, turn_ids, prefix=prompt_ids)
             completion.append(assistant_message)
             completion_ids.extend(turn_ids)
-            completion_logprobs.extend(turn_logprobs)
-            tool_mask.extend([1] * len(turn_ids))
+            messages.append(assistant_message)
+            turns.append(TurnRecord(prompt_ids, turn_ids, turn_logprobs))
             tool_calls = assistant_message.get("tool_calls")
             if tool_calls is None or (max_iterations is not None and iteration_num >= max_iterations):
-                # Token mode appends, so one conversation is always exactly one training row.
-                sequences = [
-                    TrainingSequence(
-                        input_ids=prompt_ids + completion_ids,
-                        completion_mask=[0] * len(prompt_ids) + tool_mask,
-                        old_log_probs=[0.0] * len(prompt_ids) + completion_logprobs,
-                        rollout_id=uuid.uuid4().hex,
-                    )
-                ]
-                return prompt_ids, completion, completion_ids, sequences, tool_call_count, tool_failure_count
-
+                break
             tool_messages, n_calls, n_failures = self._execute_tool_calls(tool_calls, tool_dict)
             tool_call_count += n_calls
             tool_failure_count += n_failures
             completion.extend(tool_messages)
-            suffix_ids = self._get_tool_suffix_ids(tool_messages)
-            completion_ids.extend(suffix_ids)
-            completion_logprobs.extend([0.0] * len(suffix_ids))
-            tool_mask.extend([0] * len(suffix_ids))
-            running_ids = running_ids + turn_ids + suffix_ids
+            messages.extend(tool_messages)  # tool result goes back as a MESSAGE, re-tokenized next turn
             iteration_num += 1
-
-    def _get_tool_suffix_ids(self, tool_messages: list[dict[str, Any]]) -> list[int]:
-        # Use the real tool name: some templates (e.g. GPT-OSS) derive the tool response header from
-        # the assistant's tool call name.
-        dummy_tool_calls = [{"type": "function", "function": {"name": tool_messages[0]["name"], "arguments": {}}}]
-        dummy_messages = [
-            {"role": "user", "content": "dummy"},
-            # `content: ""` is required: VLM processors crash on tokenize=True without it
-            # (KeyError in processing_utils.py, see huggingface/transformers#45290).
-            {"role": "assistant", "content": "", "tool_calls": dummy_tool_calls},
-        ]
-        prefix_ids = self.tokenizer.apply_chat_template(
-            dummy_messages,
-            add_generation_prompt=False,
-            tokenize=True,
-            chat_template=self.chat_template,
-            return_dict=False,
-            **self.chat_template_kwargs,
-        )
-        full_ids = self.tokenizer.apply_chat_template(
-            dummy_messages + tool_messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            chat_template=self.chat_template,
-            return_dict=False,
-            **self.chat_template_kwargs,
-        )
-        # Some chat templates (Qwen3/Qwen3.5) render "...<|im_end|>\n" after assistant/tool blocks.
-        # Align the slicing boundary to EOS, not EOS + newline.
-        eos_positions = [i for i, tok_id in enumerate(prefix_ids) if tok_id == self.tokenizer.eos_token_id]
-        if eos_positions:
-            prefix_ids = prefix_ids[: eos_positions[-1] + 1]
-        if full_ids[: len(prefix_ids)] != prefix_ids:
-            raise ValueError("Unexpected tokenization: the EOS-trimmed prefix IDs are not a prefix of the full IDs.")
-        return full_ids[len(prefix_ids) :]
+        sequences = _chain_to_sequences(turns, rollout_id, self._fork_threshold_tokens)  # >= 1 row per conversation
+        # element 0 (prompt_ids) is the first turn's prompt, matching the caller's unpacking
+        return turns[0].prompt_ids, completion, completion_ids, sequences, tool_call_count, tool_failure_count
 
     def _execute_tool_calls(
         self, tool_calls: list[dict[str, Any]], tool_dict: dict[str, Callable]
@@ -855,60 +818,6 @@ class AsyncRolloutLoop:
                 return content if content else {}
 
         return await _retry_on_http_error(_do_post, label=f"POST {path}", max_attempts=max_retries)
-
-
-class MessageRolloutLoop(AsyncRolloutLoop):
-    """Message-mode rollout loop: re-tokenize the whole conversation each turn and reconcile drift.
-
-    Overrides only `_generate_one`. Every turn it renders the full message list through the chat template, generates,
-    records the turn, and at the end reconciles re-tokenization drift into one or more training rows via
-    `_chain_to_sequences` (see `slime_research.md`). Generation, tool calls, parsing, and lifecycle are inherited from
-    `AsyncRolloutLoop`.
-
-    The one difference from the token-mode loop: instead of `prompt_ids = prompt_ids + turn_ids + suffix_ids` (glue
-    tokens on the end and never look back), it rebuilds `prompt_ids` from the message list each turn and lets the
-    reconciler decide whether that is a clean append (one row) or a rewrite (a new row). The tool result goes back as a
-    message and gets re-tokenized on the next whole-conversation pass, instead of being tokenized separately.
-    """
-
-    async def _generate_one(
-        self, prompt: Messages, tool_dict: dict[str, Callable]
-    ) -> tuple[list[int], list[dict[str, str]], list[int], list[TrainingSequence], int, int]:
-        messages = list(prompt)  # a MESSAGE list, not a token list
-        rollout_id = uuid.uuid4().hex
-        turns: list[TurnRecord] = []
-        completion, completion_ids = [], []
-        tool_call_count = 0
-        tool_failure_count = 0
-        iteration_num = 0
-        max_iterations = self.max_tool_calling_iterations
-        while True:
-            prompt_ids = self.tokenizer.apply_chat_template(  # re-tokenize the WHOLE conversation
-                messages,
-                return_dict=False,
-                add_generation_prompt=True,
-                tools=self.tools or None,
-                chat_template=self.chat_template,
-                **self.chat_template_kwargs,
-            )
-            turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids)
-            assistant_message = parse_response(self.tokenizer, turn_ids, prefix=prompt_ids)
-            completion.append(assistant_message)
-            completion_ids.extend(turn_ids)
-            messages.append(assistant_message)
-            turns.append(TurnRecord(prompt_ids, turn_ids, turn_logprobs))
-            tool_calls = assistant_message.get("tool_calls")
-            if tool_calls is None or (max_iterations is not None and iteration_num >= max_iterations):
-                break
-            tool_messages, n_calls, n_failures = self._execute_tool_calls(tool_calls, tool_dict)
-            tool_call_count += n_calls
-            tool_failure_count += n_failures
-            completion.extend(tool_messages)
-            messages.extend(tool_messages)  # tool result goes back as a MESSAGE, re-tokenized next turn
-            iteration_num += 1
-        sequences = _chain_to_sequences(turns, rollout_id, self._fork_threshold_tokens)  # >= 1 row per conversation
-        # element 0 (prompt_ids) matches the loop's unpacking; for message mode it's the first turn's prompt.
-        return turns[0].prompt_ids, completion, completion_ids, sequences, tool_call_count, tool_failure_count
 
 
 class AsyncRolloutWorker:

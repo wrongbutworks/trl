@@ -34,7 +34,7 @@ from transformers.data.data_collator import DataCollatorMixin
 from ...trainer.base_trainer import _BaseTrainer
 from ...trainer.utils import nanmax, nanmin, pad, patch_chunked_lm_head
 from .async_grpo_config import AsyncGRPOConfig
-from .async_rollout_worker import AsyncRolloutLoop, AsyncRolloutWorker, MessageRolloutLoop
+from .async_rollout_worker import AsyncRolloutWorker
 from .weight_transfer import WeightTransferClient
 
 
@@ -627,9 +627,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                         "packed": True,
                     },
                 )
-                loop_cls = MessageRolloutLoop if self.args.rollout_protocol == "message" else AsyncRolloutLoop
                 self.rollout_worker = AsyncRolloutWorker(
-                    loop_cls=loop_cls,
                     model_name=model_name,
                     dataset=train_dataset,
                     reward_funcs=reward_funcs,

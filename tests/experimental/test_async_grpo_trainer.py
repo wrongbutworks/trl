@@ -36,7 +36,6 @@ from trl.experimental.async_grpo.async_grpo_trainer import (
 from trl.experimental.async_grpo.async_rollout_worker import (
     AsyncRolloutLoop,
     DriftKind,
-    MessageRolloutLoop,
     RolloutGroup,
     RolloutSample,
     TrainingSequence,
@@ -359,7 +358,7 @@ _FINAL = {"role": "assistant", "content": "done"}
 
 
 def _run(monkeypatch, *, prompt_ids, turns, assistants, fork_threshold=1024, max_iters=None):
-    """Drive MessageRolloutLoop._generate_one on scripted per-turn fixtures.
+    """Drive AsyncRolloutLoop._generate_one on scripted per-turn fixtures.
 
     prompt_ids: list of the token list `apply_chat_template` returns each turn. turns: list of (turn_ids, logprobs)
     `_generate_one_turn` returns each turn. assistants: list of the message `parse_response` returns each turn.
@@ -371,7 +370,7 @@ def _run(monkeypatch, *, prompt_ids, turns, assistants, fork_threshold=1024, max
         def apply_chat_template(self, messages, **kwargs):
             return pq.pop(0)
 
-    loop = object.__new__(MessageRolloutLoop)  # skip the heavy __init__; set only what _generate_one reads
+    loop = object.__new__(AsyncRolloutLoop)  # skip the heavy __init__; set only what _generate_one reads
     loop.tokenizer = _StubTokenizer()
     loop.tools = []
     loop.chat_template = None
@@ -391,7 +390,7 @@ def _run(monkeypatch, *, prompt_ids, turns, assistants, fork_threshold=1024, max
     return tuple(rest)
 
 
-class TestMessageRolloutLoop(TrlTestCase):
+class TestRolloutLoop(TrlTestCase):
     def test_single_turn_no_tool_call(self, monkeypatch):
         completion, completion_ids, sequences, n_calls, n_failures = _run(
             monkeypatch,
